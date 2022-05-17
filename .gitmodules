@@ -1,0 +1,3 @@
+[submodule "recipe-handler-demo"]
+	path = recipe-handler-demo
+	url = https://github.com/cisaacstern/recipe-handler-demo.git
