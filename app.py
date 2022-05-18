@@ -1,23 +1,46 @@
-import os
 import subprocess
 
 import click
 from github import Github
 
+SCRIPT_REPO = "cisaacstern/recipe-handler-demo"
+ACTIONS = {
+    "repr": "scripts/print_recipe_repr.py"
+}
+
+
+def check_output(command):
+    output = subprocess.check_output(command)
+    click.echo(output)
+    return output
+
 
 @click.command()
-@click.option('--tag', prompt='notebook tag',
-              help='The pangeo notebook tag to pull.')
-@click.option('--feedstock-spec', prompt='feedstock spec')
-@click.option('--recipe-path', prompt='recipe module path')
-@click.option('--recipe-instance-name', prompt='recipe instance name')
-def pull_and_run(tag, feedstock_spec, recipe_path, recipe_instance_name):
+@click.option(
+    '--tag',
+    prompt='notebook tag',
+    default='latest',
+)
+@click.option(
+    '--feedstock-spec',
+    prompt='feedstock spec',
+    default="pangeo-forge/noaa-coastwatch-geopolar-sst-feedstock",
+)
+@click.option(
+    '--recipe-path',
+    prompt='recipe module path',
+    default="feedstock/recipe.py",
+)
+@click.option(
+    '--recipe-instance-name',
+    prompt='recipe instance name',
+    default="recipe",
+)
+@click.option('--action', prompt='action')
+def pull_and_run(tag, feedstock_spec, recipe_path, recipe_instance_name, action):
     """Pull the specified pangeo-notebook tag."""
 
-    def check_output(command):
-        output = subprocess.check_output(command)
-        click.echo(output)
-        return output
+    g = Github()
 
     # Pull the image
     notebook_img = f"pangeo/pangeo-notebook:{tag}"
@@ -25,31 +48,24 @@ def pull_and_run(tag, feedstock_spec, recipe_path, recipe_instance_name):
 
     # Start the sibling container https://stackoverflow.com/a/30209974
     container_id = check_output(f"docker run -d {notebook_img} tail -f /dev/null".split())
-    # Question: how reliable is it that `click.echo` will terminate in "\\n"?
+
+    # Question: how reliable is it that `subprocess.check_output` will terminate in "\\n"?
     container_id = container_id.decode(encoding="utf-8").replace("\\n", "")
 
-    # Get the recipe module as plain text
-    recipe_module = (
-        Github().get_repo(feedstock_spec)
-        .get_contents(recipe_path).decoded_content.decode()
-    )
-
     # Execute all commands within the notebook environment
-    cmd_base = f"docker exec {container_id} conda run -n notebook"
-    
-    # Install pangeo-forge-recipes
-    # (This can be removed once pangeo-forge-recipes is in noteboook image)
-    # https://github.com/pangeo-data/pangeo-docker-images/issues/326
-    check_output(f"{cmd_base} mamba install pangeo-forge-recipes".split())
+    cmd_base = f"docker exec {container_id} conda run -n notebook".split()
 
-    # Run a command in the sibling container
-    check_output(
-        f"{cmd_base} python3 -c".split()
-        # NOTE: This command could be replaced with something more useful, such as importing a
-        # a recipe and printing a list of `dict_object` keys to stdout. Or registering a recipe
-        # with Prefect using a provided script.
-        + [recipe_module + f"print({recipe_instance_name})"]
+    # Get the recipe module as plain text and cache it
+    recipe_module = g.get_repo(feedstock_spec).get_contents(recipe_path).decoded_content.decode()
+
+    adaptor = f"\nrecipe_instance = {recipe_instance_name}\n"
+
+    coda = (
+        g.get_repo(SCRIPT_REPO).get_contents(ACTIONS[action], ref=tag).decoded_content.decode()
     )
+
+    # Run a script in the sibling container, with the cached recipe as input
+    check_output(cmd_base + ["python3", "-c", f"{recipe_module + adaptor + coda}"])
 
     # Stop the sibling container
     check_output(f"docker stop {container_id}".split())
