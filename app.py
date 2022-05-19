@@ -9,8 +9,8 @@ ACTIONS = {
 }
 
 
-def check_output(command):
-    output = subprocess.check_output(command)
+def check_output(command, shell=False):
+    output = subprocess.check_output(command, shell=shell)
     click.echo(output)
     return output
 
@@ -32,12 +32,12 @@ def check_output(command):
     default="feedstock/recipe.py",
 )
 @click.option(
-    '--recipe-instance-name',
-    prompt='recipe instance name',
+    '--recipe-object-name',
+    prompt='recipe object name',
     default="recipe",
 )
 @click.option('--action', prompt='action')
-def pull_and_run(tag, feedstock_spec, recipe_path, recipe_instance_name, action):
+def pull_and_run(tag, feedstock_spec, recipe_path, recipe_object_name, action):
     """Pull the specified pangeo-notebook tag."""
 
     g = Github()
@@ -47,25 +47,37 @@ def pull_and_run(tag, feedstock_spec, recipe_path, recipe_instance_name, action)
     check_output(f"docker pull {notebook_img}".split())
 
     # Start the sibling container https://stackoverflow.com/a/30209974
-    container_id = check_output(f"docker run -d {notebook_img} tail -f /dev/null".split())
+    container_id = check_output(f"docker run --rm -d {notebook_img} tail -f /dev/null".split())
 
     # Question: how reliable is it that `subprocess.check_output` will terminate in "\\n"?
     container_id = container_id.decode(encoding="utf-8").replace("\\n", "")
-
-    # Execute all commands within the notebook environment
-    cmd_base = f"docker exec {container_id} conda run -n notebook".split()
+    cmd_base = f"docker exec {container_id}".split()
 
     # Get the recipe module as plain text and cache it
-    recipe_module = g.get_repo(feedstock_spec).get_contents(recipe_path).decoded_content.decode()
+    recipe_module_bytes = g.get_repo(feedstock_spec).get_contents(recipe_path).decoded_content
 
-    adaptor = f"\nrecipe_instance = {recipe_instance_name}\n"
-
-    coda = (
-        g.get_repo(SCRIPT_REPO).get_contents(ACTIONS[action], ref=tag).decoded_content.decode()
+    script_bytes = (
+        g.get_repo(SCRIPT_REPO).get_contents(ACTIONS[action], ref=tag).decoded_content
     )
 
     # Run a script in the sibling container, with the cached recipe as input
-    check_output(cmd_base + ["python3", "-c", f"{recipe_module + adaptor + coda}"])
+    check_output(cmd_base + ["bash", "-c", "mkdir pangeo-forge"])
+
+    def bytestring_to_file(fname: str, bytestring: bytes) -> list:
+        return [
+            "python3",
+            "-c",
+            f"with open('pangeo-forge/{fname}', mode='wb') as f: f.write({bytestring})",
+        ]
+
+    check_output(cmd_base + bytestring_to_file("recipe.py", recipe_module_bytes))
+    check_output(cmd_base + bytestring_to_file("script.py", script_bytes))
+    # check_output(cmd_base + ["ls", "-la"])
+    # check_output(cmd_base + ["cat", "pangeo-forge/recipe.py"])
+    # check_output(cmd_base + ["cat", "pangeo-forge/script.py"])
+    # if recipe_object_name contains a `:`, it can be interpreted as a dict-object, and handled differently
+    run = f"conda run -n notebook python3 pangeo-forge/script.py {recipe_object_name}".split()
+    check_output(cmd_base + run)
 
     # Stop the sibling container
     check_output(f"docker stop {container_id}".split())
