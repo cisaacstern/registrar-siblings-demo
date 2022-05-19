@@ -1,6 +1,6 @@
-import subprocess
-
 import click
+import docker
+from docker.models.containers import Container
 from github import Github
 
 SCRIPT_REPO = "cisaacstern/recipe-handler-demo"
@@ -9,10 +9,17 @@ ACTIONS = {
 }
 
 
-def check_output(command, shell=False):
-    output = subprocess.check_output(command, shell=shell)
-    click.echo(output)
-    return output
+def echo_output(container: Container, command: list) -> None:
+    output = container.exec_run(command).output
+    click.echo(output.decode(encoding="utf-8"))
+
+
+def bytestring_to_file(fname: str, bytestring: bytes) -> list:
+    return [
+        "python3",
+        "-c",
+        f"with open('{fname}', mode='wb') as f: f.write({bytestring})",
+    ]
 
 
 @click.command()
@@ -41,46 +48,37 @@ def pull_and_run(tag, feedstock_spec, recipe_path, recipe_object_name, action):
     """Pull the specified pangeo-notebook tag."""
 
     g = Github()
-
-    # Pull the image
-    notebook_img = f"pangeo/pangeo-notebook:{tag}"
-    check_output(f"docker pull {notebook_img}".split())
+    d = docker.from_env()
 
     # Start the sibling container https://stackoverflow.com/a/30209974
-    container_id = check_output(f"docker run --rm -d {notebook_img} tail -f /dev/null".split())
+    recipe_handler = d.containers.run(
+        f"pangeo/pangeo-notebook:{tag}", "tail -f /dev/null", detach=True, auto_remove=True,
+    )
 
-    # Question: how reliable is it that `subprocess.check_output` will terminate in "\\n"?
-    container_id = container_id.decode(encoding="utf-8").replace("\\n", "")
-    cmd_base = f"docker exec {container_id}".split()
-
-    # Get the recipe module as plain text and cache it
+    # Get the recipe module and script as plain text
     recipe_module_bytes = g.get_repo(feedstock_spec).get_contents(recipe_path).decoded_content
-
     script_bytes = (
         g.get_repo(SCRIPT_REPO).get_contents(ACTIONS[action], ref=tag).decoded_content
     )
 
-    # Run a script in the sibling container, with the cached recipe as input
-    check_output(cmd_base + ["bash", "-c", "mkdir pangeo-forge"])
+    # Cache recipe + script into a subdirectory in the sibling container
+    recipe_handler.exec_run(["bash", "-c", "mkdir pangeo-forge"])
+    recipe_handler.exec_run(bytestring_to_file("pangeo-forge/recipe.py", recipe_module_bytes))
+    recipe_handler.exec_run(bytestring_to_file("pangeo-forge/script.py", script_bytes))
 
-    def bytestring_to_file(fname: str, bytestring: bytes) -> list:
-        return [
-            "python3",
-            "-c",
-            f"with open('pangeo-forge/{fname}', mode='wb') as f: f.write({bytestring})",
-        ]
+    # echo_output(recipe_handler, ["ls", "-la"])
+    # echo_output(recipe_handler, ["cat", "pangeo-forge/recipe.py"])
+    # echo_output(recipe_handler, ["cat", "pangeo-forge/script.py"])
 
-    check_output(cmd_base + bytestring_to_file("recipe.py", recipe_module_bytes))
-    check_output(cmd_base + bytestring_to_file("script.py", script_bytes))
-    # check_output(cmd_base + ["ls", "-la"])
-    # check_output(cmd_base + ["cat", "pangeo-forge/recipe.py"])
-    # check_output(cmd_base + ["cat", "pangeo-forge/script.py"])
-    # if recipe_object_name contains a `:`, it can be interpreted as a dict-object, and handled differently
-    run = f"conda run -n notebook python3 pangeo-forge/script.py {recipe_object_name}".split()
-    check_output(cmd_base + run)
+    # Call the script on the recipe (inside the sibling container's notebook environment)
+    # TODO: If `recipe_object_name`` contains `:`, it's a dict-object, and parsed differently
+    echo_output(
+        recipe_handler,
+        f"conda run -n notebook python3 pangeo-forge/script.py {recipe_object_name}".split(),
+    )
 
     # Stop the sibling container
-    check_output(f"docker stop {container_id}".split())
+    recipe_handler.stop()
 
 if __name__ == '__main__':
     pull_and_run()
